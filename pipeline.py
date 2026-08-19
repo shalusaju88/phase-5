@@ -124,6 +124,12 @@ ALL_25_FEATURES = RAW_LEDGER_FEATURES + LATENT_MANIFOLD_FEATURES
 SENSITIVE_LIFESPAN_THRESHOLD_MINS = 43200.0  # 30 days * 24h * 60m
 
 
+import tempfile
+
+# Set non-interactive writable cache directory for Matplotlib on serverless
+os.environ.setdefault("MPLCONFIGDIR", os.path.join(tempfile.gettempdir(), "matplotlib"))
+
+
 # --------------------------------------------------------------------------------------
 # PIPELINE ORCHESTRATOR CLASS
 # --------------------------------------------------------------------------------------
@@ -136,10 +142,22 @@ class DeFiFraudInferencePipeline:
 
     def __init__(self, model_dir: Optional[str] = None):
         self.current_dir = os.path.dirname(os.path.abspath(__file__)) if '__file__' in globals() else os.getcwd()
-        self.model_dir = model_dir or os.path.join(self.current_dir, "models")
-        os.makedirs(self.model_dir, exist_ok=True)
         
-        self.model_artifact_path = os.path.join(self.model_dir, "champion_model_a_artifacts.joblib")
+        # Check writable directory for serverless environments (e.g. Vercel)
+        target_model_dir = model_dir or os.path.join(self.current_dir, "models")
+        try:
+            os.makedirs(target_model_dir, exist_ok=True)
+            self.model_dir = target_model_dir
+        except (OSError, PermissionError):
+            self.model_dir = os.path.join(tempfile.gettempdir(), "models")
+            os.makedirs(self.model_dir, exist_ok=True)
+        
+        # Prefer existing model in repo if present, otherwise write to self.model_dir
+        repo_artifact = os.path.join(self.current_dir, "models", "champion_model_a_artifacts.joblib")
+        if os.path.exists(repo_artifact):
+            self.model_artifact_path = repo_artifact
+        else:
+            self.model_artifact_path = os.path.join(self.model_dir, "champion_model_a_artifacts.joblib")
         
         # State variables
         self.stacking_model: Optional[StackingClassifier] = None
@@ -326,7 +344,7 @@ class DeFiFraudInferencePipeline:
         # Setup SHAP Explainer
         self._setup_shap_explainer()
 
-        # Serialize to disk
+        # Serialize to disk (graceful fallback if filesystem is read-only)
         artifacts = {
             "stacking_model": self.stacking_model,
             "primary_shap_model": self.primary_shap_model,
@@ -337,8 +355,11 @@ class DeFiFraudInferencePipeline:
             "shap_base_value": self.shap_base_value,
             "training_duration": time.time() - t_start
         }
-        joblib.dump(artifacts, self.model_artifact_path)
-        logger.info(f"Successfully trained and serialized Champion Model A to '{self.model_artifact_path}' in {time.time() - t_start:.2f}s")
+        try:
+            joblib.dump(artifacts, self.model_artifact_path)
+            logger.info(f"Successfully trained and serialized Champion Model A to '{self.model_artifact_path}' in {time.time() - t_start:.2f}s")
+        except Exception as e:
+            logger.warning(f"Could not persist model artifact to disk ({e}). Keeping model in memory.")
         self.is_ready = True
 
     def _initialize_synthetic_baseline(self):
